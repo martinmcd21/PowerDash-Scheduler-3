@@ -91,7 +91,6 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
     )
 
     try:
-        # Using legacy ChatCompletion-style API for broad compatibility
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -111,7 +110,6 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
         # Ensure we capture just JSON if model adds backticks
         if content.startswith("```"):
             content = content.strip("`")
-            # remove possible language hint like json\n
             if "\n" in content:
                 content = content.split("\n", 1)[1]
 
@@ -142,6 +140,10 @@ def ensure_session_state():
         st.session_state["parsed_replies"] = []
     if "selected_slot_index" not in st.session_state:
         st.session_state["selected_slot_index"] = None
+    if "email_draft_subject" not in st.session_state:
+        st.session_state["email_draft_subject"] = ""
+    if "email_draft_body" not in st.session_state:
+        st.session_state["email_draft_body"] = ""
 
 
 def format_slot_label(slot: Dict[str, str], idx: int) -> str:
@@ -221,7 +223,6 @@ def send_email_smtp(
     msg.set_content(body)
 
     if attachment:
-        # attachment: {"filename": str, "content": str, "maintype": str, "subtype": str, "params": dict}
         filename = attachment.get("filename", "attachment")
         content = attachment.get("content", "")
         maintype = attachment.get("maintype", "text")
@@ -331,24 +332,41 @@ def fetch_unread_emails_imap() -> List[Dict[str, Any]]:
 
 def detect_slot_choice_from_text(text: str) -> Dict[str, Any]:
     """
-    Lightweight NLP to detect a single slot number choice.
-    Flags as unclear if:
-    - No numbers found
-    - Multiple distinct numbers found
+    Improved NLP for candidate replies.
+    - Removes quoted email content.
+    - Uses only the candidate's first response line.
+    - Extracts the FIRST valid number only.
     """
     import re
 
-    numbers = re.findall(r"\b([1-9][0-9]?)\b", text)
+    # 1. Remove quoted email replies ("On Wed", "From:", ">" etc.)
+    quoted_patterns = [
+        r"On\s.*wrote:",
+        r"From:",
+        r"Sent:",
+        r"Subject:",
+        r"^\s*>",  # quoted lines starting with '>'
+        r"-----Original Message-----",
+    ]
+
+    cleaned = text
+    for p in quoted_patterns:
+        cleaned = re.split(p, cleaned, flags=re.IGNORECASE | re.MULTILINE)[0]
+
+    # 2. Only use the first meaningful line
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    first_line = lines[0] if lines else ""
+
+    # 3. Find numbers in first line only
+    numbers = re.findall(r"\b([1-9][0-9]?)\b", first_line)
     numbers = [int(n) for n in numbers]
 
     if not numbers:
         return {"status": "unclear", "reason": "no numbers detected", "choice": None}
 
-    unique_numbers = sorted(set(numbers))
-    if len(unique_numbers) > 1:
-        return {"status": "unclear", "reason": "multiple numbers detected", "choice": unique_numbers}
-
-    return {"status": "ok", "reason": "", "choice": unique_numbers[0]}
+    # Take only the FIRST number the candidate typed
+    choice = numbers[0]
+    return {"status": "ok", "reason": "", "choice": choice}
 
 
 def generate_ics(
@@ -359,11 +377,13 @@ def generate_ics(
     description: str,
     location: str,
     organizer_email: str,
-    attendees: List[str],
+    required_attendees: List[str],
+    optional_attendees: Optional[List[str]] = None,
 ) -> str:
     """
     Generate an ICS string with METHOD:REQUEST.
-    Times are converted to UTC (Z) and timezone is included in header.
+    Candidate + Hiring Manager should be in required_attendees.
+    Recruiter should be in optional_attendees.
     """
     tz = pytz.timezone(timezone_str)
     start_local = tz.localize(start_dt_local)
@@ -379,10 +399,16 @@ def generate_ics(
         return dt.strftime("%Y%m%dT%H%M%SZ")
 
     attendee_lines = ""
-    for a in attendees:
+    for a in required_attendees:
         if not a:
             continue
         attendee_lines += f"ATTENDEE;CN={a};ROLE=REQ-PARTICIPANT:MAILTO:{a}\n"
+
+    if optional_attendees:
+        for a in optional_attendees:
+            if not a:
+                continue
+            attendee_lines += f"ATTENDEE;CN={a};ROLE=OPT-PARTICIPANT:MAILTO:{a}\n"
 
     ics = f"""BEGIN:VCALENDAR
 PRODID:-//PowerDash HR//Interview Scheduler//EN
@@ -417,31 +443,52 @@ tab1, tab2, tab3 = st.tabs(
 
 # -------- TAB 1: NEW SCHEDULING REQUEST -------- #
 with tab1:
-    st.subheader("1. Upload Hiring Manager Availability")
+    st.subheader("New Scheduling Request")
 
-    col_upload, col_slots = st.columns([1, 1.2])
+    col_left, col_center, col_right = st.columns([1.3, 1.0, 1.3])
 
-    with col_upload:
+    # LEFT: Hiring Manager + Recruiter details
+    with col_left:
+        st.markdown("### Hiring Manager & Recruiter")
+        st.text_input("Role Title", key="role_title")
+        st.text_input("Hiring Manager Name", key="hm_name")
+        st.text_input("Hiring Manager Email", key="hm_email")
+        st.text_input("Recruiter Name", key="recruiter_name")
+        st.text_input(
+            "Recruiter / Scheduling Mailbox Email",
+            key="recruiter_email",
+            value=st.secrets.get("smtp_from", ""),
+        )
+
+    # CENTER: Upload + parse availability
+    with col_center:
+        st.markdown("### Upload Availability")
         file = st.file_uploader(
-            "Upload free/busy screenshot (PDF, PNG, JPG, JPEG)",
+            "Free/busy screenshot (PDF, PNG, JPG, JPEG)",
             type=["pdf", "png", "jpg", "jpeg"],
             accept_multiple_files=False,
         )
         parse_button = st.button("Parse Availability", type="primary", use_container_width=True)
 
-    with col_slots:
-        st.markdown("**Extracted Slots**")
+        st.markdown("#### Extracted Slots")
         if st.session_state["slots"]:
             for idx, slot in enumerate(st.session_state["slots"]):
                 st.write(format_slot_label(slot, idx))
         else:
-            st.info("No slots extracted yet. Upload a calendar view and click 'Parse Availability'.")
+            st.info("No slots extracted yet. Upload a calendar view and click **Parse Availability**.")
+
+    # RIGHT: Candidate details
+    with col_right:
+        st.markdown("### Candidate")
+        st.text_input("Candidate Name", key="candidate_name")
+        st.text_input("Candidate Email", key="candidate_email")
+
+    st.markdown("---")
 
     if parse_button and file is not None:
         try:
             images = []
             if file.type == "application/pdf":
-                # Convert PDF pages to images
                 with fitz.open(stream=file.read(), filetype="pdf") as doc:
                     for page_index in range(len(doc)):
                         page = doc.load_page(page_index)
@@ -467,81 +514,92 @@ with tab1:
         except Exception as e:
             st.error(f"Error processing file: {e}")
 
-    st.markdown("---")
+    # ----- Generate + edit + send email -----
     st.subheader("2. Generate Candidate Scheduling Email")
 
-    with st.form("email_form"):
-        col_left, col_right = st.columns(2)
+    if st.session_state["slots"]:
+        offer_indices = st.multiselect(
+            "Slots to Offer (by position)",
+            options=list(range(len(st.session_state["slots"]))),
+            default=list(range(len(st.session_state["slots"]))),
+            format_func=lambda i: format_slot_label(st.session_state["slots"][i], i),
+        )
+    else:
+        offer_indices = []
+        st.info("Extract availability first to offer slots.")
 
-        with col_left:
-            candidate_name = st.text_input("Candidate Name")
-            candidate_email = st.text_input("Candidate Email")
-            role = st.text_input("Role Title")
-            hiring_manager_name = st.text_input("Hiring Manager Name")
-            hiring_manager_email = st.text_input("Hiring Manager Email")
+    # Button to build draft
+    generate_draft = st.button("Generate Email Draft", type="secondary")
 
-        with col_right:
-            recruiter_name = st.text_input("Recruiter Name")
-            recruiter_email = st.text_input("Recruiter Email (from address if using personal mailbox)", value=st.secrets.get("smtp_from", ""))
+    if generate_draft:
+        candidate_name = st.session_state.get("candidate_name", "").strip()
+        candidate_email = st.session_state.get("candidate_email", "").strip()
+        role = st.session_state.get("role_title", "").strip()
+        hm_name = st.session_state.get("hm_name", "").strip()
+        recruiter_name = st.session_state.get("recruiter_name", "").strip()
 
-            # Choose slots to offer
-            st.markdown("**Slots to Offer (by index)**")
-            if st.session_state["slots"]:
-                offer_indices = st.multiselect(
-                    "Select which slots to offer (by position)",
-                    options=list(range(len(st.session_state["slots"]))),
-                    default=list(range(len(st.session_state["slots"]))),
-                    format_func=lambda i: format_slot_label(st.session_state["slots"][i], i),
+        if not all([candidate_name, candidate_email, role, hm_name, recruiter_name]):
+            st.error("Please complete candidate, role, hiring manager and recruiter details before generating a draft.")
+        elif not st.session_state["slots"]:
+            st.error("No availability slots have been extracted.")
+        elif not offer_indices:
+            st.error("Please select at least one slot to offer.")
+        else:
+            slots_to_offer = [st.session_state["slots"][i] for i in offer_indices]
+            email_body = build_scheduling_email(
+                candidate_name=candidate_name,
+                role=role,
+                hiring_manager_name=hm_name,
+                recruiter_name=recruiter_name,
+                slots=slots_to_offer,
+            )
+            st.session_state["email_draft_subject"] = f"Interview availability – {role}"
+            st.session_state["email_draft_body"] = email_body
+            st.success("Draft generated below. You can edit it before sending.")
+
+    st.markdown("### Email Draft (editable)")
+
+    st.text_input("Email Subject", key="email_draft_subject")
+    st.text_area("Email Body", key="email_draft_body", height=260)
+
+    send_col1, send_col2 = st.columns([1, 4])
+    with send_col1:
+        send_email_btn = st.button("Send Email", type="primary")
+
+    if send_email_btn:
+        candidate_email = st.session_state.get("candidate_email", "").strip()
+        hm_email = st.session_state.get("hm_email", "").strip()
+        recruiter_email = st.session_state.get("recruiter_email", "").strip()
+        subject = st.session_state.get("email_draft_subject", "").strip()
+        body = st.session_state.get("email_draft_body", "").strip()
+
+        if not all([candidate_email, hm_email, recruiter_email, subject, body]):
+            st.error("Please ensure candidate, hiring manager, recruiter emails and the draft subject & body are filled in.")
+        else:
+            success = send_email_smtp(
+                subject=subject,
+                body=body,
+                to_emails=[candidate_email],
+                cc_emails=[recruiter_email, hm_email],
+            )
+            if success:
+                st.success("Scheduling email sent successfully.")
+                st.session_state["email_log"].append(
+                    {
+                        "candidate": st.session_state.get("candidate_name", ""),
+                        "candidate_email": candidate_email,
+                        "role": st.session_state.get("role_title", ""),
+                        "subject": subject,
+                        "body": body,
+                    }
                 )
             else:
-                offer_indices = []
-
-        submitted = st.form_submit_button("Generate & Send Email", type="primary")
-
-        if submitted:
-            if not all([candidate_name, candidate_email, role, hiring_manager_name, hiring_manager_email, recruiter_name]):
-                st.error("Please fill in all required fields.")
-            elif not st.session_state["slots"]:
-                st.error("No availability slots have been extracted.")
-            elif not offer_indices:
-                st.error("Please select at least one slot to offer.")
-            else:
-                slots_to_offer = [st.session_state["slots"][i] for i in offer_indices]
-                email_body = build_scheduling_email(
-                    candidate_name=candidate_name,
-                    role=role,
-                    hiring_manager_name=hiring_manager_name,
-                    recruiter_name=recruiter_name,
-                    slots=slots_to_offer,
-                )
-                subject = f"Interview availability – {role}"
-
-                success = send_email_smtp(
-                    subject=subject,
-                    body=email_body,
-                    to_emails=[candidate_email],
-                    cc_emails=[recruiter_email, hiring_manager_email],
-                )
-
-                if success:
-                    st.success("Scheduling email sent successfully.")
-                    st.session_state["email_log"].append(
-                        {
-                            "candidate": candidate_name,
-                            "candidate_email": candidate_email,
-                            "role": role,
-                            "subject": subject,
-                            "body": email_body,
-                        }
-                    )
-                else:
-                    st.error("Failed to send scheduling email.")
+                st.error("Failed to send scheduling email.")
 
 
 # -------- TAB 2: SCHEDULER INBOX -------- #
 with tab2:
     st.subheader("Monitor Scheduling Mailbox (IMAP)")
-
     st.write("This reads **unread** messages only and does **not** modify or delete any email.")
 
     if st.button("Fetch Unread Replies", type="primary"):
@@ -556,7 +614,7 @@ with tab2:
                     {
                         "from": em["from"],
                         "subject": em["subject"],
-                        "body_preview": em["body"][:200].replace("\n", " ") + ("..." if len(em["body"]) > 200 else ""),
+                        "body_preview": em["body"][:400].replace("\n", " ") + ("..." if len(em["body"]) > 400 else ""),
                         "status": detection["status"],
                         "reason": detection["reason"],
                         "choice": detection["choice"],
@@ -584,7 +642,7 @@ with tab3:
     st.subheader("Generate & Send Calendar Invites (ICS)")
 
     if not st.session_state["slots"]:
-        st.warning("No slots available. Please parse availability in Tab 1 first.")
+        st.warning("No slots available. Please parse availability in the **New Scheduling Request** tab first.")
     else:
         st.markdown("### Available Slots")
         slot_index = st.radio(
@@ -601,34 +659,50 @@ with tab3:
         col_left, col_right = st.columns(2)
 
         with col_left:
-            candidate_email_ci = st.text_input("Candidate Email")
-            hiring_manager_email_ci = st.text_input("Hiring Manager Email")
-            recruiter_email_ci = st.text_input("Recruiter Email (optional CC)", value=st.secrets.get("smtp_from", ""))
+            candidate_email_ci = st.text_input(
+                "Candidate Email",
+                value=st.session_state.get("candidate_email", ""),
+            )
+            hiring_manager_email_ci = st.text_input(
+                "Hiring Manager Email",
+                value=st.session_state.get("hm_email", ""),
+            )
+            recruiter_email_ci = st.text_input(
+                "Recruiter Email (optional CC / optional attendee)",
+                value=st.session_state.get("recruiter_email", st.secrets.get("smtp_from", "")),
+            )
 
-            interview_type = st.selectbox("Interview Type", ["Teams", "Face-to-Face"])
+            interview_type = st.selectbox("Interview Type", ["Teams", "In-Person"])
             timezone_str = st.text_input("Timezone (IANA format)", value="Europe/London")
 
         with col_right:
-            role_ci = st.text_input("Role Title")
-            organizer_email_ci = st.text_input("Organizer/Scheduling Mailbox", value=st.secrets.get("smtp_from", "scheduling@powerdashhr.com"))
-
-            teams_link = ""
-            location = ""
+            role_ci = st.text_input(
+                "Role Title",
+                value=st.session_state.get("role_title", ""),
+            )
+            organizer_email_ci = st.text_input(
+                "Organizer / Scheduling Mailbox",
+                value=st.secrets.get("smtp_from", "scheduling@powerdashhr.com"),
+            )
 
             if interview_type == "Teams":
-                teams_link = st.text_area("Teams Meeting Link / Instructions")
+                teams_link = st.text_area("Teams Meeting Link / Joining Instructions")
                 location = "Microsoft Teams"
+                in_person_notes = ""
             else:
-                location = st.text_input("On-site Location")
                 teams_link = ""
+                location = st.text_input("In-Person Location (address)")
+                in_person_notes = st.text_area(
+                    "In-Person Address & Instructions (will appear on invite)"
+                )
 
-            additional_notes = st.text_area("Additional Notes (optional)", "")
+        additional_notes = st.text_area("Additional Notes (optional)", "")
 
         generate_btn = st.button("Generate & Send Invite", type="primary")
 
         if generate_btn:
             if not all([candidate_email_ci, hiring_manager_email_ci, role_ci, organizer_email_ci]):
-                st.error("Please fill in all mandatory invite fields.")
+                st.error("Please fill in all mandatory invite fields (candidate, hiring manager, role, organizer).")
             else:
                 try:
                     date_str = selected_slot["date"]
@@ -640,12 +714,21 @@ with tab3:
 
                     subject = f"{role_ci} Interview"
                     description_parts = [f"Interview for: {role_ci}"]
+
                     if interview_type == "Teams" and teams_link:
                         description_parts.append(f"Teams link: {teams_link}")
+                    if interview_type == "In-Person":
+                        if location:
+                            description_parts.append(f"Location: {location}")
+                        if in_person_notes:
+                            description_parts.append(f"Instructions: {in_person_notes}")
                     if additional_notes:
                         description_parts.append(f"Notes: {additional_notes}")
 
                     description = "\n".join(description_parts)
+
+                    required_attendees = [candidate_email_ci, hiring_manager_email_ci]
+                    optional_attendees = [recruiter_email_ci] if recruiter_email_ci else []
 
                     ics_content = generate_ics(
                         start_dt_local=start_dt_local,
@@ -653,12 +736,12 @@ with tab3:
                         timezone_str=timezone_str,
                         subject=subject,
                         description=description,
-                        location=location,
+                        location=location if interview_type == "In-Person" else "Microsoft Teams",
                         organizer_email=organizer_email_ci,
-                        attendees=[candidate_email_ci, hiring_manager_email_ci, recruiter_email_ci],
+                        required_attendees=required_attendees,
+                        optional_attendees=optional_attendees,
                     )
 
-                    # Download button
                     st.download_button(
                         label="Download ICS File",
                         data=ics_content,
@@ -666,7 +749,6 @@ with tab3:
                         mime="text/calendar",
                     )
 
-                    # Send via SMTP
                     email_body = (
                         f"Please find attached the calendar invite for your interview.\n\n"
                         f"{description}\n\n"
@@ -685,7 +767,7 @@ with tab3:
                         subject=subject,
                         body=email_body,
                         to_emails=[candidate_email_ci, hiring_manager_email_ci],
-                        cc_emails=[recruiter_email_ci] if recruiter_email_ci else None,
+                        cc_emails=optional_attendees if optional_attendees else None,
                         attachment=attachment,
                     )
 
